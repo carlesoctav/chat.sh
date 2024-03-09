@@ -37,15 +37,15 @@ func CacheTokenNewAuth(token string) error {
     filePath := filepath.Join(homeDir, ".config", ".chatsh")
     f, err := os.Create(filePath)
 
+    if err != nil {
+        return err
+    }
     cache := Cache{
         GithubToken: token,
         ExpiresAt: "",
         CopilotToken: "",
     }
 
-    if err != nil {
-        return err
-    }
 
     defer f.Close()
 
@@ -100,10 +100,10 @@ func VerifyGithub(deviceCode string) error {
     }
 
     err = json.Unmarshal(data, &results)
-    fmt.Fprintf(os.Stdout, deviceCode)
     if _, ok := results["access_token"]; !ok{
         return errors.New("please do the instruction")
     }
+
     err = CacheTokenNewAuth(results["access_token"])
 
     if err != nil {
@@ -130,14 +130,12 @@ func githubAuthenticate() error {
             continue
         }
 
-        if err != nil {
-            return err
-        }
-
-        if err == nil {
-            return nil
-        }
+            if err == nil {
+                break
+            }
     }
+
+    return nil
     
 }
 
