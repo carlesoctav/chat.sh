@@ -1,9 +1,11 @@
 package chatsh
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"io/fs"
@@ -11,8 +13,20 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/atotto/clipboard"
 	"github.com/google/uuid"
 )
+
+var (
+    chatCmd = flag.NewFlagSet("chat", flag.ExitOnError)
+    setupCmd = flag.NewFlagSet("setup", flag.ExitOnError)
+)
+
+
+var subcommands = map[string]*flag.FlagSet{
+    chatCmd.Name(): chatCmd,
+    setupCmd.Name(): setupCmd,
+}
 
 type Message struct {
     Role    string `json:"role,omitempty"`
@@ -37,10 +51,11 @@ type CopilotChatPayload struct {
 }
 
 type CopilotSession struct{
+    chat string
     githubToken string
     copilotToken string
     chatUrl string
-    input string
+    input io.Reader
     output io.Writer
     chatHistory []Message
     chatPrompt Message
@@ -55,7 +70,7 @@ func NewInputWithInputFromArgs (args []string) copilotOption{
             return nil
         }
 
-        c.input = args[0]
+        c.chat = args[0]
         return nil
     }
 }
@@ -81,10 +96,10 @@ func NewCopilotSession(opts ...copilotOption) (*CopilotSession, error){
     if err != nil {
         return nil, err
     }
-
     c := &CopilotSession{
         githubToken: cache.GithubToken,
-        input: "is go better than python for CLI tooling?",
+        chat :"",
+        input: os.Stdin,
         output: os.Stdout,
         chatHistory: []Message{},
         chatUrl: "https://api.githubcopilot.com/chat/completions",
@@ -130,7 +145,6 @@ func (c *CopilotSession) Authenticate() (error){
     }
 
     defer res.Body.Close()
-
     var results struct{
         Token string `json:"token"`
     } 
@@ -149,6 +163,17 @@ func (c *CopilotSession) Authenticate() (error){
     return nil
 }
 
+
+func (c *CopilotSession) Save() error {
+    f, err := os.Create(c.chatFile)
+
+    if err != nil {
+        return err
+    }
+    defer f.Close()
+    return json.NewEncoder(f).Encode(c.chatHistory)
+}
+
 func (c *CopilotSession) Chat() error{
     err := c.Authenticate()
 
@@ -165,15 +190,27 @@ func (c *CopilotSession) Chat() error{
         messagePayload= append(messagePayload, chatHis)
     }
 
-    messagePayload = append(messagePayload, Message{
-        Role: "user",
-        Content: c.input,
-    })
+    if c.chat == ""{
+        scanner := bufio.NewScanner(c.input)
+        text := ""
+        for scanner.Scan() {
+            text += scanner.Text()
+        }
 
+        messagePayload = append(messagePayload, Message{
+            Role: "user",
+            Content: text,
+        })
+    } else {
+        messagePayload = append(messagePayload, Message{
+            Role: "user",
+            Content: c.chat,
+        })
+    }
     jsonBody := &CopilotChatPayload{
         Messages: messagePayload,
         Model:       "gpt-4",
-        Temperature: 0.5,
+        Temperature: 0.1,
         TopP:        1,
         N:           1,
         Stream:      false,
@@ -211,6 +248,19 @@ func (c *CopilotSession) Chat() error{
         return err
     }
 
+    if c.chatFile != ""{
+        c.chatHistory = messagePayload[1:]
+        c.chatHistory = append(c.chatHistory, Message{
+            Role: "assistant",
+            Content: content.Choices[0].Message.Content,
+        })
+        err = c.Save()
+    }
+
+    if err != nil {
+        return err
+    }
+
     fmt.Println(content.Choices[0].Message.Content)
 
     return nil
@@ -242,21 +292,16 @@ func (c *CopilotSession) SetChatFile(chatFile string) error {
 func (c *CopilotSession) SetPrompt(prompt string) error {
     c.chatPrompt = Message{
         Role: "system",
-        Content: fmt.Sprintln(prompt),
+        Content: prompt,
     }
-
     return nil
 }
 
 
 func (c *CopilotSession) CreateHeader ()map[string]string{
-    // Vscode_sessionid :="d805ed55-17f8-4a1c-8b18-2a46db32bf98"
-    // Vscode_machineid := "de8b0050-86cc-4cdf-8477-377a37a6a27f" 
     return map[string]string{
         "Authorization":         "Bearer " + c.copilotToken,
         "X-Request-Id":          uuid.NewString(),
-        // "Vscode-Sessionid":      Vscode_sessionid,
-        // "Vscode-Machineid":      Vscode_machineid,
         "Editor-Version":        "vscode/1.83.1",
         "Editor-Plugin-Version": "copilot-chat/0.8.0",
         "Openai-Organization":   "github-copilot",
@@ -278,31 +323,54 @@ func MainAuthenticate() int {
         fmt.Fprintln(os.Stdout, err)
         return 0
     }
-
-    fmt.Println("Login Success")
+    fmt.Println("Authenticate Success")
     return 1
 
 }
 
-func MainChat() int {
-    copilot, err := NewCopilotSession(NewInputWithInputFromArgs(os.Args[2:]))
+func MainChat(flag *flag.FlagSet) int {
+    chatFile := flag.String("chat-file", "", "add previous chat context specified by chat-file")
+    prompt := flag.String("prompt", "", "custom prompt")
+    clipBoardContext := flag.Bool("clipboard-context", false, "add clipboardas another context")
+    flag.Usage = func(){
+        fmt.Printf("Usage: %s chat [-chat-file] [-prompt] [-clipboard-context] [query]\n", os.Args[0])
+        flag.PrintDefaults()
+    }
+    flag.Parse(os.Args[2:])
+    copilot, err := NewCopilotSession(NewInputWithInputFromArgs(flag.Args()))
     if err != nil {
         fmt.Fprintln(os.Stderr, err)
         return 1
     }
 
-    // if *chatFile != ""{
-    //     err = copilot.SetChatFile(*chatFile)
-    // }
-    // if *prompt != ""{
-    //     err = copilot.SetPrompt(*prompt)
-    // }
-    // if err != nil {
-    //     fmt.Fprintln(os.Stderr, err)
-    //     return 1
-    // }
+    if *prompt != ""{
+        err = copilot.SetPrompt(*prompt)
+    }
 
-    fmt.Println(copilot)
+    if *chatFile != ""{
+        err = copilot.SetChatFile(*chatFile)
+    }
+
+
+    if *clipBoardContext {
+        text, err := clipboard.ReadAll()
+
+        if err != nil {
+            fmt.Fprintln(os.Stderr, err)
+            return 1
+        }
+
+        copilot.chatHistory = append(copilot.chatHistory, Message{
+            Role: "user",
+            Content:text,
+        })
+    }
+
+    if err != nil {
+        fmt.Fprintln(os.Stderr, err)
+        return 1
+    }
+
     err = copilot.Chat()
     if err != nil {
         fmt.Fprintln(os.Stderr, err)
@@ -312,24 +380,44 @@ func MainChat() int {
 }
 
 func Main() int {
-    // chatFile := flag.String("chat-file","", "file that stores the history (in json)") 
-    // prompt := flag.String("prompt", "", "changing the system prompt")
-    // flag.Usage = func() {
-    //     fmt.Printf("Setup: %s setup\n", os.Args[0])
-    //     fmt.Printf("Usage: %s chat [-prompt] [-chat-file] [text]\n", os.Args[0])
-    //     flag.PrintDefaults()
-    // }
 
-    // flag.Parse() 
-    command := os.Args[1]
+    usage := `Usage: chatsh [COMMAND]
+    Examples:
+    chatsh chat "How to install Git on Windows"
+    Chat with Copilot. This command will prompt text to the Copilot API.
 
-    switch command {
+    chatsh chat -chat-file ./test.json "Rewrite everything with Go"
+    Same as above, but with previous chat context specified by ./test.json.
+
+    chatsh chat -h
+
+    chatsh setup
+    Setup Copilot for this CLI.
+
+    Available Commands:
+    setup   Setup OAuth
+    chat    Chat with Copilot`
+
+
+    if len(os.Args) < 2 {
+        fmt.Println(usage)
+        return 1
+    }
+    command := subcommands[os.Args[1]]
+
+    if command == nil {
+        fmt.Println("subcommand doesnt exist")
+        return 1
+    }
+
+    switch command.Name() {
         case "setup":
             return MainAuthenticate()
         case "chat":
-            return MainChat()
+            return MainChat(command)
     }
 
+    fmt.Fprintf(os.Stderr, usage)
     return 1
 
 }
